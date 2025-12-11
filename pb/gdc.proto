@@ -1,0 +1,34 @@
+// 版权所有 (C)2025, Simon·Richard
+// 完成时间: 2025.12.4 16:31
+// 这个 .proto 文件是 给 GoCache 这个分布式缓存系统定义 RPC 接口和数据格式的规范文件，用来让 gRPC 生成跨进程、跨语言的访问代码
+
+// 使用 proto3 语法
+syntax = "proto3";
+
+// 包名
+package pb;
+
+// go_package 用来指定生成的 Go 包路径
+option go_package = "./";
+
+// message 可以理解成“跨语言的 struct 定义”
+message Request {
+  string group = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message ResponseForGet {
+  bytes value = 1;
+}
+
+message ResponseForDelete {
+  bool value = 1;
+}
+
+// gRPC 服务接口
+service GoCache {
+  rpc Get(Request) returns (ResponseForGet);
+  rpc Set(Request) returns (ResponseForGet);
+  rpc Delete(Request) returns(ResponseForDelete);
+}
