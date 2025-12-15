@@ -20,7 +20,10 @@ func main() {
 	// 定义一个命令行参数：-port
 	// 不带参数：go run main.go → 端口 = 8001
 	// 指定端口：go run main.go -port=8002 → 端口 = 8002
+	// 返回的是 *int（指针），所以 port 是个“指向整数的指针”
 	port := flag.Int("port", 8001, "节点端口")
+
+	// 返回的是 *string，所以 nodeID 是个“指向字符串的指针”
 	nodeID := flag.String("node", "A", "节点标识符")
 	flag.Parse()
 
@@ -30,7 +33,9 @@ func main() {
 	// 创建节点
 	// 一个“自己本机的缓存节点对象”(node)
 	// 启动一个缓存 Server（注册到 etcd，提供 gRPC 服务）
+	// addr：这是这个缓存节点自己对外提供 gRPC 服务的监听地址(我这个节点对外提供服务的端口是 8001，别人要找我干活就连我 8001)
 	node, err := lcache.NewServer(addr, "go-cache",
+		// 电话簿(通讯录)在本机的 2379 端口，去那里登记/查人
 		lcache.WithEtcdEndpoints([]string{"localhost:2379"}),
 		lcache.WithDialTimeout(5*time.Second),
 	)
@@ -45,7 +50,8 @@ func main() {
 		log.Fatal("创建节点选择器失败:", err)
 	}
 
-	// 创建缓存 Group，并挂上这个 Picker
+	// 创建缓存组 Group：管理本地缓存 + 统一读写逻辑（本地 / 远程 / 回源）
+	// GetterFunc(这个函数) 把它“转成 GetterFunc 类型”
 	group := lcache.NewGroup("test", 2<<20, lcache.GetterFunc(
 		func(ctx context.Context, key string) ([]byte, error) {
 			log.Printf("[节点%s] 触发数据源加载: key=%s", *nodeID, key)
@@ -59,13 +65,14 @@ func main() {
 		}),
 	)
 
-	// 注册节点选择器
+	// 注册节点选择器(把 picker 注册给 group：让 group 具备“分布式能力”)
 	group.RegisterPeers(picker)
 
+	// 启动 Server（异步 goroutine）并把 ctx 作为生命周期控制
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	defer cancel1()
 
-	// 启动节点
+	// 启动节点(放到 goroutine 里：因为 Start 会阻塞（Serve 一直跑）)
 	go func() {
 		log.Printf("[节点%s] 开始启动服务...", *nodeID)
 		if err := node.Start(ctx1); err != nil {
@@ -79,7 +86,7 @@ func main() {
 
 	ctx := context.Background()
 
-	// 设置本节点的特定键值对
+	// 往 group 写入一个“本节点专属 key”, 设置本节点的特定键值对
 	localKey := fmt.Sprintf("key_%s", *nodeID)
 	// localValue := []byte(fmt.Sprintf("这是节点%s的数据", *nodeID))
 
@@ -130,6 +137,7 @@ func main() {
 		}
 	}
 
-	// 主 goroutine 一直卡在这里
+	// 主 goroutine 一直卡在这里(select {} 是 Go 里最简单的“永久阻塞”的写法)
+	// for {}（但 for 会空转吃 CPU）
 	select {}
 }

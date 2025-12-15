@@ -217,6 +217,7 @@ func TestCacheBasic(t *testing.T) {
 
 	t.Run("遍历缓存", func(t *testing.T) {
 		c := Create(5)
+		now := Now()
 
 		// 添加3项
 		for i := 1; i <= 3; i++ {
@@ -225,7 +226,7 @@ func TestCacheBasic(t *testing.T) {
 
 		// 遍历并收集所有键
 		var keys []string
-		c.walk(func(key string, value Value, expireAt int64) bool {
+		c.walk(now, func(key string, value Value, expireAt int64) bool {
 			keys = append(keys, key)
 			return true
 		})
@@ -245,7 +246,7 @@ func TestCacheBasic(t *testing.T) {
 
 		// 测试提前终止遍历
 		var earlyKeys []string
-		c.walk(func(key string, value Value, expireAt int64) bool {
+		c.walk(now, func(key string, value Value, expireAt int64) bool {
 			earlyKeys = append(earlyKeys, key)
 			return len(earlyKeys) < 2 // 只收集前2个键
 		})
@@ -305,6 +306,7 @@ func TestCacheLRUEviction(t *testing.T) {
 // 测试walk方法
 func TestCacheWalk(t *testing.T) {
 	c := Create(5)
+	now := Now()
 
 	// 添加几个项
 	c.put("key1", testValue("value1"), Now()+int64(time.Hour), nil)
@@ -316,7 +318,7 @@ func TestCacheWalk(t *testing.T) {
 
 	// 使用walk收集所有项
 	var keys []string
-	c.walk(func(key string, value Value, expireAt int64) bool {
+	c.walk(now, func(key string, value Value, expireAt int64) bool {
 		keys = append(keys, key)
 		return true
 	})
@@ -328,7 +330,7 @@ func TestCacheWalk(t *testing.T) {
 
 	// 测试提前终止遍历
 	count := 0
-	c.walk(func(key string, value Value, expireAt int64) bool {
+	c.walk(now, func(key string, value Value, expireAt int64) bool {
 		count++
 		return false // 只处理第一个项
 	})

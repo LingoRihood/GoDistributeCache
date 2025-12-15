@@ -68,7 +68,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 
 	// 3. 创建租约（带超时）
 	/*
-		以外部传入的 ctx 为父 ctx，创建一个 3 秒超时的子 ctx：
+		以外部传入的 ctx 为父 ctx，创建一个 3 秒超时的子 ctx：leaseCtx 是从 ctx 派生出来的子 context
 		3 秒内若 Grant 没返回，就会自动超时取消；
 		外部一旦 ctx 被取消，leaseCtx 也会跟着取消
 	*/
@@ -101,6 +101,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 	}
 
 	// 5. 启动租约续期（KeepAlive）
+	// kaCtx 继承自外部 ctx：外部 ctx 结束（cancel/timeout）→ kaCtx 也结束 → 续租停止
 	kaCtx, cancelKA := context.WithCancel(ctx)
 
 	// 启动一个后台心跳机制，定期向 etcd 发送续约请求，让 lease 一直存活
@@ -111,7 +112,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 		return fmt.Errorf("failed to keep lease alive: %w", err)
 	}
 
-	// 6. 后台处理续期 & 下线
+	// 6. 后台处理续期 & 下线:后台 goroutine：处理续租反馈 + 退出时主动 Revoke
 	go func() {
 		defer func() {
 			// cancelKA()：停止 keepalive
@@ -122,6 +123,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 		for {
 			select {
 			// 当外面调用 cancel() 或 ctx 超时时
+			// 服务准备退出 → 主动下线
 			case <-ctx.Done():
 				// ctx 结束 → 主动撤销租约，下线服务
 				// 创建一个新的 context：revokeCtx，最多等 3 秒
@@ -138,6 +140,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 				cancel()
 				return
 
+			// 打印续租日志
 			case resp, ok := <-keepAliveCh:
 				if !ok {
 					logrus.Warn("keep alive channel closed")

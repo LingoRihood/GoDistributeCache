@@ -33,6 +33,26 @@ type lru2Store struct {
 	onEvicted   func(key string, value Value) // 驱逐回调函数
 	cleanupTick *time.Ticker                  // 定期清理定时器
 	mask        int32                         // 用于哈希取模的掩码
+	done        chan struct{}
+	closed      int32 // 给 lru2Store 加一个 done 通道 + 关闭标记（防重复 Close）
+}
+
+const (
+	expireDeleted  int64 = 0  // 已删除 / 无效
+	expireNoExpire int64 = -1 // 永不过期（有效）
+)
+
+func isExpired(expireAt, now int64) bool {
+	// expireAt > 0 才代表“有具体过期时间”
+	return expireAt > 0 && now >= expireAt
+}
+
+func computeExpireAt(expiration time.Duration) int64 {
+	// expiration <= 0 表示永不过期
+	if expiration <= 0 {
+		return expireNoExpire
+	}
+	return Now() + expiration.Nanoseconds()
 }
 
 // cap uint16：缓存能容纳的节点数量上限，最多有 cap 个元素。
@@ -88,6 +108,7 @@ func newLRU2Cache(opts Options) *lru2Store {
 		onEvicted:   opts.OnEvicted,
 		cleanupTick: time.NewTicker(opts.CleanupInterval),
 		mask:        int32(mask),
+		done:        make(chan struct{}),
 	}
 
 	for i := range s.caches {
@@ -130,9 +151,9 @@ func Now() int64 {
 // 从缓存中删除键对应的项
 // 这个 del 并没有“物理删除”掉节点，而是做了“逻辑删除 + 移到空闲链表尾部”。
 func (c *cache) del(key string) (*node, int, int64) {
-	if idx, ok := c.hmap[key]; ok && c.m[idx-1].expireAt > 0 {
+	if idx, ok := c.hmap[key]; ok && c.m[idx-1].expireAt != expireDeleted {
 		e := c.m[idx-1].expireAt
-		c.m[idx-1].expireAt = 0 // 标记为已删除
+		c.m[idx-1].expireAt = expireDeleted // 标记为已删除
 		// n     uint16 = 1   p     uint16 = 0
 		c.adjust(idx, n, p) // 移动到链表尾部
 		return &c.m[idx-1], 1, e
@@ -173,13 +194,13 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 	s.locks[idx].Lock()
 	defer s.locks[idx].Unlock()
 
-	currentTime := Now()
+	now := Now()
 
 	// 首先检查一级缓存
 	n1, status1, expireAt := s.caches[idx][0].del(key)
 	if status1 > 0 {
 		// 从一级缓存找到项目
-		if expireAt > 0 && currentTime >= expireAt {
+		if isExpired(expireAt, now) {
 			// 项目已过期，删除它
 			s.delete(key, idx)
 			fmt.Println("找到项目已过期，删除它")
@@ -195,7 +216,7 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 	// L1 没命中：去二级缓存 L2 查
 	n2, status2 := s._get(key, idx, 1)
 	if status2 > 0 && n2 != nil {
-		if n2.expireAt > 0 && currentTime >= n2.expireAt {
+		if isExpired(n2.expireAt, now) {
 			// 项目已过期，删除它
 			s.delete(key, idx)
 			fmt.Println("找到项目已过期，删除它")
@@ -212,17 +233,20 @@ func (s *lru2Store) Get(key string) (Value, bool) {
 func (s *lru2Store) Set(key string, value Value) error {
 	// 9999999999999999 ns = 10,000,000,000 s ≈ 115.7 天
 	// 这个 Set 默认就是“过期时间 ≈ 116 天以后”
-	return s.SetWithExpiration(key, value, 9999999999999999)
+	// return s.SetWithExpiration(key, value, 9999999999999999)
+	return s.SetWithExpiration(key, value, 0) // 0 表示永不过期
 }
 
 // time.Duration 底层是 int64 的纳秒数
 func (s *lru2Store) SetWithExpiration(key string, value Value, expiration time.Duration) error {
 	// 计算过期时间 - 确保单位一致
-	expireAt := int64(0)
-	if expiration > 0 {
-		// now() 返回纳秒时间戳，确保 expiration 也是纳秒单位
-		expireAt = Now() + int64(expiration.Nanoseconds())
-	}
+	// expireAt := int64(0)
+	// if expiration > 0 {
+	// 	// now() 返回纳秒时间戳，确保 expiration 也是纳秒单位
+	// 	expireAt = Now() + int64(expiration.Nanoseconds())
+	// }
+
+	expireAt := computeExpireAt(expiration)
 
 	idx := hashBKRD(key) & s.mask
 	s.locks[idx].Lock()
@@ -246,11 +270,24 @@ func (s *lru2Store) Delete(key string) bool {
 // dlnk[0][0] 存储尾结点索引, dlnk[0][1] 存储头结点索引
 // 也就是按 LRU 顺序从“最久未使用”到“最新使用”遍历整条链表
 // 遍历缓存中的所有有效项
-func (c *cache) walk(walker func(key string, value Value, expireAt int64) bool) {
+func (c *cache) walk(now int64, walker func(key string, value Value, expireAt int64) bool) {
 	// n = 1
 	for idx := c.dlnk[0][n]; idx != 0; idx = c.dlnk[idx][n] {
+
+		exp := c.m[idx-1].expireAt
+
+		// 已删除
+		if exp == expireDeleted {
+			continue
+		}
+
+		// 已过期
+		if isExpired(exp, now) {
+			continue
+		}
 		// 同步回调walker
-		if c.m[idx-1].expireAt > 0 && !walker(c.m[idx-1].k, c.m[idx-1].v, c.m[idx-1].expireAt) {
+		// 有效（包括 exp=-1 永不过期）
+		if !walker(c.m[idx-1].k, c.m[idx-1].v, exp) {
 			return
 		}
 	}
@@ -258,16 +295,17 @@ func (c *cache) walk(walker func(key string, value Value, expireAt int64) bool) 
 
 // Clear 实现Storer接口
 func (s *lru2Store) Clear() {
+	now := Now()
 	var keys []string
 
 	for i := range s.caches {
 		s.locks[i].Lock()
 
-		s.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
+		s.caches[i][0].walk(now, func(key string, value Value, expireAt int64) bool {
 			keys = append(keys, key)
 			return true
 		})
-		s.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
+		s.caches[i][1].walk(now, func(key string, value Value, expireAt int64) bool {
 			// 检查键是否已经收集（避免重复）
 			for _, k := range keys {
 				if key == k {
@@ -291,15 +329,16 @@ func (s *lru2Store) Clear() {
 // Len 实现Storer接口
 func (s *lru2Store) Len() int {
 	count := 0
+	now := Now()
 
 	for i := range s.caches {
 		s.locks[i].Lock()
 
-		s.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
+		s.caches[i][0].walk(now, func(key string, value Value, expireAt int64) bool {
 			count++
 			return true
 		})
-		s.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
+		s.caches[i][1].walk(now, func(key string, value Value, expireAt int64) bool {
 			count++
 			return true
 		})
@@ -311,51 +350,98 @@ func (s *lru2Store) Len() int {
 }
 
 // Close 关闭缓存相关资源
+// func (s *lru2Store) Close() {
+// 	if s.cleanupTick != nil {
+// 		// time.Ticker.Stop() 不会关闭 C 这个 channel，官方就是这么设计的：
+// 		// 「Stop 会停止计时，但不会 close channel，避免误读成功。」
+// 		s.cleanupTick.Stop()
+// 	}
+// }
+
 func (s *lru2Store) Close() {
+	if !atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
+		return
+	}
 	if s.cleanupTick != nil {
-		// time.Ticker.Stop() 不会关闭 C 这个 channel，官方就是这么设计的：
-		// 「Stop 会停止计时，但不会 close channel，避免误读成功。」
 		s.cleanupTick.Stop()
 	}
+	// close(s.done) 必须只执行一次，否则会 panic
+	close(s.done)
 }
 
+// func (s *lru2Store) cleanupLoop() {
+// 	// 这是一个无限循环，每当 Ticker 产生一个 tick（往 C 写入时间）时，循环体执行一次。
+// 	// 是一种 从 channel 持续读数据直到 channel 关闭 的写法，这里是每来一个 ticker 的 tick，就执行一次循环体，只是我们不关心具体 tick 时间，所以省略了接收变量
+// 	for range s.cleanupTick.C {
+// 		currentTime := Now()
+
+// 		for i := range s.caches {
+// 			s.locks[i].Lock()
+
+// 			// 检查并清理过期项目
+// 			var expiredKeys []string
+
+// 			s.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
+// 				if expireAt > 0 && currentTime >= expireAt {
+// 					expiredKeys = append(expiredKeys, key)
+// 				}
+// 				return true
+// 			})
+
+// 			s.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
+// 				if expireAt > 0 && currentTime >= expireAt {
+// 					for _, k := range expiredKeys {
+// 						if key == k {
+// 							// 避免重复
+// 							return true
+// 						}
+// 					}
+// 					expiredKeys = append(expiredKeys, key)
+// 				}
+// 				return true
+// 			})
+
+// 			for _, key := range expiredKeys {
+// 				s.delete(key, int32(i))
+// 			}
+
+// 			s.locks[i].Unlock()
+// 		}
+// 	}
+// }
+
 func (s *lru2Store) cleanupLoop() {
-	// 这是一个无限循环，每当 Ticker 产生一个 tick（往 C 写入时间）时，循环体执行一次。
-	// 是一种 从 channel 持续读数据直到 channel 关闭 的写法，这里是每来一个 ticker 的 tick，就执行一次循环体，只是我们不关心具体 tick 时间，所以省略了接收变量
-	for range s.cleanupTick.C {
-		currentTime := Now()
+	for {
+		select {
+		case <-s.cleanupTick.C:
+			now := Now()
+			for i := range s.caches {
+				s.locks[i].Lock()
 
-		for i := range s.caches {
-			s.locks[i].Lock()
+				var expiredKeys []string
 
-			// 检查并清理过期项目
-			var expiredKeys []string
-
-			s.caches[i][0].walk(func(key string, value Value, expireAt int64) bool {
-				if expireAt > 0 && currentTime >= expireAt {
-					expiredKeys = append(expiredKeys, key)
-				}
-				return true
-			})
-
-			s.caches[i][1].walk(func(key string, value Value, expireAt int64) bool {
-				if expireAt > 0 && currentTime >= expireAt {
-					for _, k := range expiredKeys {
-						if key == k {
-							// 避免重复
-							return true
-						}
+				s.caches[i][0].walk(now, func(key string, value Value, expAt int64) bool {
+					if isExpired(expAt, now) {
+						expiredKeys = append(expiredKeys, key)
 					}
-					expiredKeys = append(expiredKeys, key)
-				}
-				return true
-			})
+					return true
+				})
+				s.caches[i][1].walk(now, func(key string, value Value, expAt int64) bool {
+					if isExpired(expAt, now) {
+						expiredKeys = append(expiredKeys, key)
+					}
+					return true
+				})
 
-			for _, key := range expiredKeys {
-				s.delete(key, int32(i))
+				for _, key := range expiredKeys {
+					s.delete(key, int32(i))
+				}
+
+				s.locks[i].Unlock()
 			}
 
-			s.locks[i].Unlock()
+		case <-s.done:
+			return
 		}
 	}
 }
@@ -482,9 +568,15 @@ func (c *cache) get(key string) (*node, int) {
 // 在指定分片、指定层级(L1/L2)里查 key，并额外做一次过期/有效性检查
 func (s *lru2Store) _get(key string, idx, level int32) (*node, int) {
 	if n, st := s.caches[idx][level].get(key); st > 0 && n != nil {
-		currentTime := Now()
-		if n.expireAt <= 0 || currentTime >= n.expireAt {
-			// 过期或已删除
+		now := Now()
+
+		// 已删除
+		if n.expireAt == expireDeleted {
+			return nil, 0
+		}
+
+		// 有过期时间且已过期
+		if isExpired(n.expireAt, now) {
 			return nil, 0
 		}
 		return n, st

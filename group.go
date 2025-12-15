@@ -23,6 +23,15 @@ var (
 	groups   = make(map[string]*Group)
 )
 
+// 避免 context key 冲突（staticcheck SA1029）
+type ctxKey int
+
+// iota 是 Go 的“自增常量生成器”
+const (
+	// 等价于 const fromPeerKey ctxKey = 0
+	fromPeerKey ctxKey = iota
+)
+
 // ErrKeyRequired 键不能为空错误
 var ErrKeyRequired = errors.New("key is required")
 
@@ -42,8 +51,8 @@ type Getter interface {
 // GetterFunc 函数类型实现 Getter 接口
 type GetterFunc func(ctx context.Context, key string) ([]byte, error)
 
-// “GetterFunc 的 Get 方法其实就是调用自己这个函数。”
-// Get 实现 Getter 接口
+// “GetterFunc 的 Get 方法其实就是调用自己这个函数。” Get 实现 Getter 接口
+// 当你对一个 GetterFunc 调用 .Get(...) 时，其实就是把它当函数执行。
 func (f GetterFunc) Get(ctx context.Context, key string) ([]byte, error) {
 	// 把这个函数本身当作函数来调用
 	return f(ctx, key)
@@ -185,7 +194,10 @@ func (g *Group) Set(ctx context.Context, key string, value []byte) error {
 	}
 
 	// 检查是否是从其他节点同步过来的请求
-	isPeerRequest := ctx.Value("from_peer") != nil
+	isPeerRequest := false
+	if v, ok := ctx.Value(fromPeerKey).(bool); ok && v {
+		isPeerRequest = true
+	}
 
 	// 创建缓存视图
 	view := ByteView{b: cloneBytes(value)}
@@ -220,7 +232,10 @@ func (g *Group) Delete(ctx context.Context, key string) error {
 	g.mainCache.Delete(key)
 
 	// 检查是否是从其他节点同步过来的请求
-	isPeerRequest := ctx.Value("from_peer") != nil
+	isPeerRequest := false
+	if v, ok := ctx.Value(fromPeerKey).(bool); ok && v {
+		isPeerRequest = true
+	}
 
 	// 如果不是从其他节点同步过来的请求，且启用了分布式模式，同步到其他节点
 	if !isPeerRequest && g.peers != nil {
@@ -245,7 +260,10 @@ func (g *Group) syncToPeers(ctx context.Context, op string, key string, value []
 	}
 
 	// 创建同步请求上下文
-	syncCtx := context.WithValue(context.Background(), "from_peer", true)
+	// syncCtx := context.WithValue(context.Background(), "from_peer", true)
+
+	// 用传入 ctx 作为 parent，继承取消/超时；并标记“来自 peer”
+	syncCtx := context.WithValue(ctx, fromPeerKey, true)
 
 	var err error
 	switch op {
@@ -253,6 +271,8 @@ func (g *Group) syncToPeers(ctx context.Context, op string, key string, value []
 		err = peer.Set(syncCtx, g.name, key, value)
 	case "delete":
 		_, err = peer.Delete(g.name, key)
+	default:
+		return
 	}
 
 	if err != nil {
@@ -296,7 +316,7 @@ func (g *Group) Close() error {
 func (g *Group) load(ctx context.Context, key string) (value ByteView, err error) {
 	// 使用 singleflight 确保并发请求只加载一次
 	startTime := time.Now()
-	viewi, err := g.loader.Do(key, func() (interface{}, error) {
+	viewi, err := g.loader.Do(key, func() (any, error) {
 		return g.loadData(ctx, key)
 	})
 
@@ -314,11 +334,17 @@ func (g *Group) load(ctx context.Context, key string) (value ByteView, err error
 	}
 
 	// 对 viewi 做了一个类型断言：认为 viewi 一定是 ByteView 类型。
-	view := viewi.(ByteView)
+	// view := viewi.(ByteView)
+
+	view, ok := viewi.(ByteView)
+	if !ok {
+		return ByteView{}, fmt.Errorf("singleflight returned %T, want ByteView", viewi)
+	}
 
 	// 设置到本地缓存
 	if g.expiration > 0 {
 		// 上层 load 会再把这个 value 存入本地缓存
+		// time.Now().Add(g.expiration) 是绝对过期时间；AddWithExpiration 里会转成 TTL
 		g.mainCache.AddWithExpiration(key, view, time.Now().Add(g.expiration))
 	} else {
 		g.mainCache.Add(key, view)
@@ -356,6 +382,7 @@ func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err e
 
 // getFromPeer 从其他节点获取数据
 func (g *Group) getFromPeer(ctx context.Context, peer Peer, key string) (ByteView, error) {
+	_ = ctx // 显式标记“暂时不用”
 	bytes, err := peer.Get(g.name, key)
 	if err != nil {
 		return ByteView{}, fmt.Errorf("failed to get from peer: %w", err)
@@ -374,8 +401,8 @@ func (g *Group) RegisterPeers(peers PeerPicker) {
 }
 
 // Stats 返回缓存统计信息
-func (g *Group) Stats() map[string]interface{} {
-	stats := map[string]interface{}{
+func (g *Group) Stats() map[string]any {
+	stats := map[string]any{
 		"name":          g.name,
 		"closed":        atomic.LoadInt32(&g.closed) == 1,
 		"expiration":    g.expiration,

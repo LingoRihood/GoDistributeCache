@@ -41,7 +41,7 @@ type Options struct {
 	OnEvicted       func(key string, value Value)
 }
 
-// NewStore 创建缓存存储实例
+// NewStore：工厂函数（Factory Pattern）创建缓存存储实例
 func NewStore(cacheType CacheType, opts Options) Storer {
 	switch cacheType {
 	case LRU2:

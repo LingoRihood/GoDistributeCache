@@ -37,14 +37,14 @@ type Peer interface {
 
 // ClientPicker 实现了PeerPicker接口
 type ClientPicker struct {
-	selfAddr string
-	svcName  string
-	mu       sync.RWMutex
-	consHash *consistenthash.Map
-	clients  map[string]*Client
-	etcdCli  *clientv3.Client
-	ctx      context.Context
-	cancel   context.CancelFunc
+	selfAddr string              // 自己的地址（用于避免把自己当远端）
+	svcName  string              // 服务名，用于拼 etcd 的 key 前缀
+	mu       sync.RWMutex        // 保护 consHash/clients 的并发读写
+	consHash *consistenthash.Map // 一致性哈希环
+	clients  map[string]*Client  // addr -> gRPC client
+	etcdCli  *clientv3.Client    // etcd client
+	ctx      context.Context     // 控制后台协程生命周期
+	cancel   context.CancelFunc  // Close() 时取消 ctx
 }
 
 // PickerOption 定义配置选项
@@ -130,7 +130,7 @@ func (p *ClientPicker) fetchAllServices() error {
 	defer cancel()
 
 	// 把所有 /services/go-cache/* 的 key 都查出来
-	resp, err := p.etcdCli.Get(ctx, "/services/"+p.svcName, clientv3.WithPrefix())
+	resp, err := p.etcdCli.Get(ctx, "/services/"+p.svcName+"/", clientv3.WithPrefix())
 	if err != nil {
 		return fmt.Errorf("failed to get all services: %v", err)
 	}
@@ -269,6 +269,7 @@ func (p *ClientPicker) Close() error {
 	if len(errs) > 0 {
 		return fmt.Errorf("errors while closing: %v", errs)
 	}
+
 	return nil
 }
 

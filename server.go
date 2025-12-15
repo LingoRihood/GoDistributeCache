@@ -1,6 +1,7 @@
 /***************************************************************
 * 版权所有 (C)2025, Simon·Richard
 * 完成时间: 2025.12.10 17:04
+* 对外提供 gRPC 接口（Get/Set/Delete）——别人通过网络来访问你这台机器上的缓存。把自己注册到 etcd——让其他节点能“发现”你
 ***************************************************************/
 
 package gocache
@@ -31,32 +32,39 @@ type Server struct {
 	addr       string           // 服务地址
 	svcName    string           // 服务名称
 	groups     *sync.Map        // 缓存组
-	grpcServer *grpc.Server     // gRPC服务器
-	etcdCli    *clientv3.Client // etcd客户端
+	grpcServer *grpc.Server     // 真正的 gRPC 服务实例
+	etcdCli    *clientv3.Client // etcd 客户端，给服务注册/发现用
 	stopCh     chan error       // 停止信号
-	opts       *ServerOptions   // 服务器选项
+	opts       ServerOptions    // 服务器选项
 }
 
 // ServerOptions 服务器配置选项
 type ServerOptions struct {
 	// etcd 集群地址列表，比如：[]string{"127.0.0.1:2379","127.0.0.1:2380"}
-	EtcdEndpoints []string      // etcd端点
-	DialTimeout   time.Duration // 连接超时
-	MaxMsgSize    int           // 最大消息大小
+	EtcdEndpoints []string      // etcd端点, 告诉它连哪个 etcd 集群（“通讯录”）
+	DialTimeout   time.Duration // 连 etcd 的超时
+	MaxMsgSize    int           // 最大消息大小, gRPC 单条消息最大接收大小（避免超大请求）
 	TLS           bool          // 是否启用TLS
 	CertFile      string        // 证书文件
 	KeyFile       string        // 密钥文件
 }
 
 // DefaultServerOptions 默认配置
-var DefaultServerOptions = &ServerOptions{
+// var DefaultServerOptions = &ServerOptions{
+// 	EtcdEndpoints: []string{"localhost:2379"},
+// 	DialTimeout:   5 * time.Second,
+
+// 	// 1MB = 1024 KB = 1048576 字节
+// 	// 4 << 20 = 4 * 1048576 = 4194304
+// 	// 使用左移运算（<<）进行乘法运算，尤其是在处理 2 的幂次方时，可以更高效地进行计算，因为计算机硬件优化了这种操作
+// 	MaxMsgSize: 4 << 20, // 4MB
+// }
+
+// DefaultServerOptions 默认配置（注意：值，不是 *指针）
+var DefaultServerOptions = ServerOptions{
 	EtcdEndpoints: []string{"localhost:2379"},
 	DialTimeout:   5 * time.Second,
-
-	// 1MB = 1024 KB = 1048576 字节
-	// 4 << 20 = 4 * 1048576 = 4194304
-	// 使用左移运算（<<）进行乘法运算，尤其是在处理 2 的幂次方时，可以更高效地进行计算，因为计算机硬件优化了这种操作
-	MaxMsgSize: 4 << 20, // 4MB
+	MaxMsgSize:    4 << 20, // 4MB
 }
 
 // ServerOption 定义选项函数类型
@@ -103,12 +111,18 @@ func WithTLS(certFile, keyFile string) ServerOption {
 
 // NewServer 创建新的服务器实例
 func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
+	// options := DefaultServerOptions
+	// for _, opt := range opts {
+	// 	opt(options)
+	// }
+
+	// ✅ 拷贝默认配置（值拷贝），不会污染全局默认值
 	options := DefaultServerOptions
 	for _, opt := range opts {
-		opt(options)
+		opt(&options)
 	}
 
-	// 创建etcd客户端
+	// 创建etcd客户端, 读取配置，建立 etcd 连接
 	etcdCli, err := clientv3.New(clientv3.Config{
 		Endpoints:   options.EtcdEndpoints,
 		DialTimeout: options.DialTimeout,
@@ -117,8 +131,10 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 		return nil, fmt.Errorf("failed to create etcd client: %v", err)
 	}
 
-	// 创建gRPC服务器
+	// 创建 gRPC Server，并根据配置添加选项
 	var serverOpts []grpc.ServerOption
+
+	// 防止有人发超大 payload 造成内存/性能风险
 	serverOpts = append(serverOpts, grpc.MaxRecvMsgSize(options.MaxMsgSize))
 
 	// 如果配置了 TLS，就加载证书
@@ -146,7 +162,7 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 	}
 
 	// 1. 注册业务服务（缓存服务）
-	// 把你的 srv 挂到 srv.grpcServer 上，让 gRPC 知道：以后别人发来的 GoCache 相关的 RPC 请求，都交给这个 srv 来处理
+	// 把你的 srv 挂到 srv.grpcServer 上，告诉 gRPC：以后凡是 GoCache 的 RPC 请求，就调用 srv.Get / srv.Set / srv.Delete
 	pb.RegisterGoCacheServer(srv.grpcServer, srv)
 
 	// 2. 创建健康检查服务并注册到同一个 gRPC server
@@ -265,10 +281,21 @@ func (s *Server) Set(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, 
 	// 从 ctx 里读一个值：
 	// 如果以前有人用 context.WithValue 写过这个 key，就能拿到那个值；
 	// 如果没人写过，就会返回 nil
-	fromPeer := ctx.Value("from_peer")
-	if fromPeer == nil {
-		ctx = context.WithValue(ctx, "from_peer", true)
-	}
+	// fromPeer := ctx.Value("from_peer")
+	// if fromPeer == nil {
+	// 	ctx = context.WithValue(ctx, "from_peer", true)
+	// }
+
+	// 这是 peer->peer 的同步请求入口：直接标记来源，避免 SA1029（不要用 string 当 key）
+	// 这个标记是为了防止“节点A同步给B，B又同步回A，死循环”
+	/*
+		如果 不是来自 peer 的请求（比如用户直接写本机）
+		→ 才需要同步到其他节点（syncToPeers）
+
+		如果 是来自 peer 的请求（说明这是别人同步过来的）
+		→ 绝对不能再同步出去，否则会形成环
+	*/
+	ctx = context.WithValue(ctx, fromPeerKey, true)
 
 	if err := group.Set(ctx, req.Key, req.Value); err != nil {
 		return nil, err

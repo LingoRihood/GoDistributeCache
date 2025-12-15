@@ -1,6 +1,7 @@
 /***************************************************************
 * 版权所有 (C)2025, Simon·Richard
 * 完成时间: 2025.12.3 21:36
+* 把缓存里的数据用“只读视图”封装起来，避免外部拿到内部的 []byte 后随意修改，破坏缓存一致性
 ***************************************************************/
 
 package gocache
@@ -11,6 +12,7 @@ type ByteView struct {
 	b []byte
 }
 
+// 返回数据长度
 func (b ByteView) Len() int {
 	return len(b.b)
 }
@@ -22,10 +24,13 @@ func cloneBytes(b []byte) []byte {
 	return c
 }
 
+// 对外返回字节切片（拷贝版）
 func (b ByteView) ByteSLice() []byte {
 	return cloneBytes(b.b)
 }
 
+// 把字节视图转成字符串
+// 从 []byte 转 string 通常会发生一次拷贝（确保字符串不可变）
 func (b ByteView) String() string {
 	return string(b.b)
 }

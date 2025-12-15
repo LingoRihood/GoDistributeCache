@@ -12,9 +12,9 @@ import (
 // 代表正在进行或已结束的请求
 type call struct {
 	// 用来让其它 goroutine 等待这次调用结束
-	wg  sync.WaitGroup
-	// 调用的返回值 
-	val interface{}
+	wg sync.WaitGroup
+	// 调用的返回值
+	val any
 	// 调用返回的错误信息
 	err error
 }
@@ -27,13 +27,14 @@ type Group struct {
 
 // 核心方法 Do：同 key 的请求合并执行
 // Do 针对相同的key，保证多次调用Do()，都只会调用一次fn
-func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+// func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+func (g *Group) Do(key string, fn func() (any, error)) (any, error) {
 	// 先看有没有“正在进行中的请求”
 	// Check if there is already an ongoing call for this key
 	// sync.Map 的 key、value 类型都是 interface{}，使用时要做类型断言
 	if existing, ok := g.m.Load(key); ok {
 		c := existing.(*call)
-		
+
 		// 当前 goroutine 不再执行 fn，而是等待已经在执行的那次调用结束。
 		// 等待期间，这个 goroutine 会阻塞在这里。
 		c.wg.Wait()         // Wait for the existing request to finish

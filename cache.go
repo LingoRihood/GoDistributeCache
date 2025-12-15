@@ -238,6 +238,7 @@ func (c *Cache) Close() {
 	if c.store != nil {
 		// 运行时判断 store 是否实现了 Close
 		if closer, ok := c.store.(interface{ Close() }); ok {
+			// closer 实际上指向同一个 *lru2Store
 			closer.Close()
 		}
 		c.store = nil
@@ -250,9 +251,9 @@ func (c *Cache) Close() {
 }
 
 // Stats 返回缓存统计信息
-func (c *Cache) Stats() map[string]interface{} {
+func (c *Cache) Stats() map[string]any {
 	// 用 interface{} 是为了让 map 里可以混放 bool/int64/float64 等不同类型的数据；
-	stats := map[string]interface{}{
+	stats := map[string]any{
 		"initialized": atomic.LoadInt32(&c.initialized) == 1,
 		"closed":      atomic.LoadInt32(&c.closed) == 1,
 		"hits":        atomic.LoadInt64(&c.hits),
