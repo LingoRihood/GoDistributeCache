@@ -4,7 +4,6 @@ go 1.25.4
 
 require (
 	github.com/sirupsen/logrus v1.9.3
-	github.com/teivah/100-go-mistakes v0.0.0-20250924105717-ab425833b58d
 	go.etcd.io/etcd/client/v3 v3.6.6
 )
 
