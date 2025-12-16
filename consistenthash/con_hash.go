@@ -124,7 +124,7 @@ func WithConfig(config *Config) Option {
 
 // addNodeLocked 在写锁下调用：为真实节点添加 replicas 个虚拟节点
 func (m *Map) addNodeLocked(node string, replicas int) {
-	for i := range replicas {
+	for i := 0; i < replicas; i++ {
 		hash := int(m.config.HashFunc([]byte(fmt.Sprintf("%s-%d", node, i))))
 		m.keys = append(m.keys, hash)
 		m.hashMap[hash] = node
@@ -397,6 +397,7 @@ func (m *Map) checkAndRebalance() {
 }
 
 // rebalanceNodes 根据统计负载调整 replicas，并重建哈希环
+// 一个很重要的“例外”：你这个 rebalanceNodes() 会打破“只变一小段”的直觉
 func (m *Map) rebalanceNodes() {
 	// 独占整个 Map 的结构（keys / hashMap / nodeReplicas / nodeCounts）
 	m.mu.Lock()

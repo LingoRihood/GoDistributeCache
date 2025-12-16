@@ -380,7 +380,7 @@ func (g *Group) loadData(ctx context.Context, key string) (value ByteView, err e
 	return ByteView{b: cloneBytes(bytes)}, nil
 }
 
-// getFromPeer 从其他节点获取数据
+// getFromPeer 从其他节点获取数据(真正调用“远端 peer.Get”的地方)
 func (g *Group) getFromPeer(ctx context.Context, peer Peer, key string) (ByteView, error) {
 	_ = ctx // 显式标记“暂时不用”
 	bytes, err := peer.Get(g.name, key)
