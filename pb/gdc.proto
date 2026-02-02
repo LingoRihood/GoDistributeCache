@@ -3,6 +3,7 @@
 // 这个 .proto 文件是 给 GoCache 这个分布式缓存系统定义 RPC 接口和数据格式的规范文件，用来让 gRPC 生成跨进程、跨语言的访问代码
 
 // 使用 proto3 语法
+// Protocol Buffers（Protobuf） 的语法版本声明
 syntax = "proto3";
 
 // 包名

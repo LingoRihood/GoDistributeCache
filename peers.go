@@ -27,6 +27,7 @@ type PeerPicker interface {
 	Close() error
 }
 
+// client.go：封装 gRPC Client，作为“远端节点代理”，实现 Peer 接口
 // Peer 定义了缓存节点的接口
 type Peer interface {
 	Get(group string, key string) ([]byte, error)
