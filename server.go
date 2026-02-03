@@ -110,6 +110,9 @@ func WithTLS(certFile, keyFile string) ServerOption {
 }
 
 // NewServer 创建新的服务器实例
+// 这段代码先构造 gRPC server 的配置（最大消息/可选 TLS），用这些配置创建 grpcServer，
+// 然后把业务服务 GoCache 和标准健康检查服务注册到同一个 gRPC server 上，并将服务状态标记为 SERVING，
+// 最后返回组装好的 srv。
 func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 	// options := DefaultServerOptions
 	// for _, opt := range opts {
@@ -124,7 +127,14 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 
 	// 创建etcd客户端, 读取配置，建立 etcd 连接
 	etcdCli, err := clientv3.New(clientv3.Config{
-		Endpoints:   options.EtcdEndpoints,
+		// etcd 通常是个集群，可能有多个节点地址
+		// 例如[]string{"10.0.0.10:2379", "10.0.0.11:2379", "10.0.0.12:2379"}
+		// 为什么要 list？
+		// 因为 etcd 集群可能有 leader/故障切换，客户端可以自动尝试其它 endpoint。
+		Endpoints: options.EtcdEndpoints,
+		// “我最多等多久能连上 etcd，超过这个时间就算失败。”
+		// 比如 5 秒内连不上：直接报错返回，不会一直卡死
+		// 这对服务启动非常重要：否则启动阶段可能无限挂住
 		DialTimeout: options.DialTimeout,
 	})
 	if err != nil {
@@ -134,10 +144,11 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 	// 创建 gRPC Server，并根据配置添加选项
 	var serverOpts []grpc.ServerOption
 
-	// 防止有人发超大 payload 造成内存/性能风险
+	// 防止有人发超大 payload 把内存打爆/拖垮性能，所以设置一个上限
 	serverOpts = append(serverOpts, grpc.MaxRecvMsgSize(options.MaxMsgSize))
 
 	// 如果配置了 TLS，就加载证书
+	// 默认配置里 TLS 没开
 	if options.TLS {
 		creds, err := loadTLSCredentials(options.CertFile, options.KeyFile)
 		if err != nil {
@@ -155,6 +166,7 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 		// grpc.NewServer(serverOpts[0], serverOpts[1], serverOpts[2], ...)
 		// 函数定义里：opts ...ServerOption
 		// 函数调用时：NewServer(addr, svcName, serverOpts...)
+		// 用这些配置创建一台 gRPC 接线台
 		grpcServer: grpc.NewServer(serverOpts...),
 		etcdCli:    etcdCli,
 		stopCh:     make(chan error),
@@ -163,13 +175,18 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 
 	// 1. 注册业务服务（缓存服务）
 	// 把你的 srv 挂到 srv.grpcServer 上，告诉 gRPC：以后凡是 GoCache 的 RPC 请求，就调用 srv.Get / srv.Set / srv.Delete
+	// 告诉 gRPC：凡是客户端调用 GoCache 这个服务的 RPC，都交给 srv 这个对象来处理
+	// 把 srv 注册成“GoCache 服务的接线员”
 	pb.RegisterGoCacheServer(srv.grpcServer, srv)
 
 	// 2. 创建健康检查服务并注册到同一个 gRPC server
 	// 这个服务专门响应一个标准的 RPC：Check，用来查询当前服务是不是健康
 	healthServer := health.NewServer()
 
-	// 把刚刚那个 healthServer 注册到同一个 gRPC 服务器 srv.grpcServer 上
+	// 同一个端口可以提供多个 gRPC service：
+	// GoCache service
+	// gRPC health service
+	// 把这个健康服务也挂到同一个 gRPC 服务器 srv.grpcServer 上
 	healthpb.RegisterHealthServer(srv.grpcServer, healthServer)
 
 	// 3. 标记这个服务名当前是“健康可用”的
@@ -204,7 +221,7 @@ func NewServer(addr, svcName string, opts ...ServerOption) (*Server, error) {
 // Start 启动服务器
 func (s *Server) Start(ctx context.Context) error {
 	// 启动 gRPC 监听 监听端口, 在本机打开一个 TCP 端口，等待客户端来连。
-	// 监听成功返回一个 net.Listener（这里叫 lis）
+	// 监听成功返回一个 net.Listener监听器（这里叫 lis）
 	lis, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("failed to listen: %v", err)
@@ -212,10 +229,12 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// 启动一个 goroutine，在后台把服务 svcName 的 addr 注册到 etcd 里去，生命周期由 ctx 控制
 	// 注册到 etcd（用 ctx 控制生命周期）
+	// 因为注册里面会有 keepalive 心跳，是个“长期运行”的逻辑
+	// 同时下面 Serve(lis) 会阻塞，所以注册要放后台跑
 	go func() {
 		if err := registry.Register(ctx, s.svcName, s.addr); err != nil {
 			logrus.Errorf("failed to register service: %v", err)
-			// 注册失败这里先只打日志，是否要强制退出看你自己需求
+			// 注册失败这里先只打日志，是否要强制退出看需求
 		}
 	}()
 
@@ -223,12 +242,16 @@ func (s *Server) Start(ctx context.Context) error {
 	logrus.Infof("Server starting at %s", s.addr)
 
 	// 在 lis 这个监听器上接收客户端连接；为每个连接读取 gRPC 请求
-	// 会开始接受客户端连接、执行 RPC 函数，这就是“服务器开始工作”的时刻
+	// 这就是“服务器开始工作”的时刻
+	// 开始在这个端口上接收连接、接收 gRPC 请求，并把请求分发到对应的 RPC 方法（Get/Set/Delete）
+	// 这句会一直阻塞运行，直到 Stop 或者出错
+	// 从这句开始，本节点就“对外可用了”
 	return s.grpcServer.Serve(lis)
 }
 
 // Stop 停止服务器
 // 收到退出信号（Ctrl+C、SIGTERM）的时候调用
+// 像餐厅：不再接新客，但把正在吃饭的客人服务完再关门
 func (s *Server) Stop() {
 	// 优雅停止 gRPC server
 	// 不再接受新的连接和请求；让正在处理的 RPC 调用慢慢跑完；等这些都处理完，再真正关闭；
@@ -253,6 +276,7 @@ func (s *Server) Stop() {
 
 // Get：从某个缓存分组里读一个 key
 // Get 实现Cache服务的Get方法
+// 接到读请求 → 转给 group.go
 func (s *Server) Get(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, error) {
 	// 从某个缓存分组里读一个 key
 	group := GetGroup(req.Group)
@@ -287,6 +311,7 @@ func (s *Server) Set(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, 
 	// }
 
 	// 这是 peer->peer 的同步请求入口：直接标记来源，避免 SA1029（不要用 string 当 key）
+	// SA1029：context.WithValue 的 key 不要用 string / int 等内置类型，要用自定义类型（或私有 struct）避免冲突。
 	// 这个标记是为了防止“节点A同步给B，B又同步回A，死循环”
 	/*
 		如果 不是来自 peer 的请求（比如用户直接写本机）
@@ -295,6 +320,7 @@ func (s *Server) Set(ctx context.Context, req *pb.Request) (*pb.ResponseForGet, 
 		如果 是来自 peer 的请求（说明这是别人同步过来的）
 		→ 绝对不能再同步出去，否则会形成环
 	*/
+	// 本机直接调用 group.Set(ctx, ...)（不是 gRPC）
 	ctx = context.WithValue(ctx, fromPeerKey, true)
 
 	if err := group.Set(ctx, req.Key, req.Value); err != nil {

@@ -11,16 +11,14 @@ import (
 
 // 代表正在进行或已结束的请求
 type call struct {
-	// 用来让其它 goroutine 等待这次调用结束
-	wg sync.WaitGroup
-	// 调用的返回值
-	val any
-	// 调用返回的错误信息
-	err error
+	wg  sync.WaitGroup // 让别的 goroutine 等待
+	val any            // fn() 的返回值
+	err error          // fn() 的错误
 }
 
 // Group 结构体：管理所有 key 对应的调用
 // Group manages all kinds of calls
+// 并发读写多时比普通 map+大锁更友好
 type Group struct {
 	m sync.Map // 使用sync.Map来优化并发性能
 }
@@ -96,7 +94,10 @@ func (g *Group) Do(key string, fn func() (any, error)) (any, error) {
 	c := &call{}
 	c.wg.Add(1)
 
-	// 原子操作：要么我把 c 放进去成为“第一个”，要么拿到别人放进去的 call
+	// 原子抢占：只有第一个 goroutine 会 loaded=false, 要么其他 goroutine 拿到别人放进去的 call
+	// 如果键值已存在，LoadOrStore 函数返回该键的现有值。否则，它会存储并返回给定的值。
+	// 如果值已加载，则加载结果为 true；如果值已存储，则加载结果为 false。
+	// 返回的是“同一个对象的引用（指针）”
 	actual, loaded := g.m.LoadOrStore(key, c)
 	if loaded {
 		// 已经有人在跑这个 key 了，我等它跑完，直接复用它的结果

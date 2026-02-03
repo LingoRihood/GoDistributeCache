@@ -154,8 +154,7 @@ func (m *Map) Add(nodes ...string) error {
 		}
 
 		// 为节点添加虚拟节点
-		// 如果已存在：你可以选择直接跳过或覆盖，这里选择“覆盖 replicas=DefaultReplicas”
-		// 先移除旧的虚拟节点再加新的，避免重复
+		// 如果已存在先移除旧的虚拟节点再加新的，避免重复
 		if m.nodeReplicas[node] > 0 {
 			m.removeLocked(node)
 		}
@@ -163,6 +162,11 @@ func (m *Map) Add(nodes ...string) error {
 	}
 
 	// ints 将整数切片按升序排序
+	// i 是有序的，但 hash(node-i) 产生的结果不保证有序
+	// 所以很可能出现：
+	// hash(node-0) = 80
+	// hash(node-1) = 10
+	// hash(node-2) = 60
 	sort.Ints(m.keys)
 	return nil
 }
@@ -213,6 +217,9 @@ func (m *Map) Remove(node string) error {
 }
 
 // removeLocked 必须在写锁下调用
+// 把这些虚拟节点从 hashMap 里删除（虚拟点不再指向这个 node）
+// 把这些虚拟节点 hash 从 keys（环上的有序点集合）里删掉
+// 清掉 node 的元数据：nodeReplicas、nodeCounts
 func (m *Map) removeLocked(node string) error {
 	replicas := m.nodeReplicas[node]
 	if replicas == 0 {
@@ -223,6 +230,11 @@ func (m *Map) removeLocked(node string) error {
 	// map[int]struct{} 在 Go 里常用来当 set（集合）
 	// key 是你要放进集合的元素（这里是虚拟节点的 hash 值）
 	// value 用 struct{} 是因为它不占内存（空结构体大小为 0），只关心 key 是否存在
+	// 一致性哈希里，一个真实节点 node 不止一个点，而是 replicas 个虚拟节点：
+	// hash(node-0)
+	// hash(node-1)
+	// ...
+	// hash(node-(replicas-1))
 	removeSet := make(map[int]struct{}, replicas)
 	for i := 0; i < replicas; i++ {
 		hash := int(m.config.HashFunc([]byte(fmt.Sprintf("%s-%d", node, i))))
@@ -348,6 +360,7 @@ func (m *Map) checkAndRebalance() {
 
 	// 2. 读节点数量 & nodeCounts，需要用锁保护 map
 	m.mu.RLock()
+	// 真实结点个数
 	nodeCount := len(m.nodeReplicas)
 	if nodeCount == 0 {
 		m.mu.RUnlock()
@@ -356,6 +369,7 @@ func (m *Map) checkAndRebalance() {
 
 	// 计算负载情况
 	// 计算理论平均负载
+	// 理论平均每个真实节点应该处理多少请求
 	avgLoad := float64(total) / float64(nodeCount)
 	if avgLoad == 0 {
 		m.mu.RUnlock()
@@ -373,11 +387,13 @@ func (m *Map) checkAndRebalance() {
 	// }
 
 	for node := range m.nodeReplicas {
+		// 某个真实结点的请求数
 		ptr := m.nodeCounts[node]
 		var cnt int64
 		if ptr != nil {
 			cnt = atomic.LoadInt64(ptr)
 		}
+		// 相对偏差 = |某个真实结点的请求数 - 理论平均每个真实节点应该处理多少请求|
 		diff := math.Abs(float64(cnt) - avgLoad)
 		ratio := diff / avgLoad
 		if ratio > maxDiff {
@@ -416,7 +432,7 @@ func (m *Map) rebalanceNodes() {
 		return
 	}
 
-	// 理论上每个节点“应该”处理的平均请求数
+	// 理论上每个真实节点“应该”处理的平均请求数
 	avgLoad := float64(total) / float64(len(m.nodeReplicas))
 	if avgLoad == 0 {
 		// 理论上 total>0 时 avgLoad 不会是 0，这里只是兜底
@@ -468,7 +484,7 @@ func (m *Map) rebalanceNodes() {
 		if ptr != nil {
 			cnt = atomic.LoadInt64(ptr)
 		}
-
+		// 某个真实结点的请求数 / 理论上每个真实节点“应该”处理的平均请求数
 		loadRatio := float64(cnt) / avgLoad
 
 		var replicas int

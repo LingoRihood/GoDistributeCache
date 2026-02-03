@@ -29,6 +29,11 @@ var DefaultConfig = &Config{
 }
 
 // Register 注册服务到etcd
+// Register(ctx, svcName, addr) 会把当前节点地址写进 etcd（作为服务发现的“在线名单”），
+// 并且用租约 + 心跳让它一直保持在线；当 ctx 结束时主动撤销租约，服务自动下线。
+// 可以把 etcd 想成群聊公告栏/通讯录：
+// 在线的人会把自己的联系方式贴上去
+// 离线的人（不续租）会自动被公告栏删掉
 // func Register(svcName, addr string, stopCh <-chan error) error {
 func Register(ctx context.Context, svcName, addr string) error {
 	// 创建 etcd 客户端
@@ -36,7 +41,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 		Endpoints:   DefaultConfig.Endpoints,
 		DialTimeout: DefaultConfig.DialTimeout,
 	})
-	// 从你的服务进程 → 去连 etcd 服务器
+	// 从服务进程 → 去连 etcd 服务器
 	// 这一步没有成功连上 etcd 集群
 	if err != nil {
 		return fmt.Errorf("failed to create etcd client: %v", err)
@@ -50,6 +55,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 	}
 
 	// 处理服务地址：如果只给了端口，自动补上本机 IP
+	// 为了避免传 ":8001" 这种地址时，写进 etcd 的信息没法被别的机器访问
 	localIP, err := getLocalIP()
 	if err != nil {
 		// 是用于关闭 etcd 客户端连接的操作
@@ -62,6 +68,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 		return fmt.Errorf("addr is empty")
 	}
 
+	// 如果 addr 是 ":8001"，改成 "192.168.1.100:8001"
 	if addr[0] == ':' {
 		addr = fmt.Sprintf("%s%s", localIP, addr)
 	}
@@ -77,6 +84,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 		向 etcd 申请一个租约，TTL = 10 秒。
 		租约 ID 存在 lease.ID 里面。
 	*/
+	// 这一步要经过网络 → etcd → 返回结果
 	lease, err := cli.Grant(leaseCtx, 10) // TTL = 10 秒
 
 	// Grant 返回后，这个 leaseCtx 已经没用了，及时 cancel()：防止 context 泄露
@@ -87,7 +95,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 	}
 
 	// 4. 写入服务信息（带超时）
-	// 构造 key，比如：/services/user-service/192.168.1.100:8080
+	// 构造 key，比如：/services/go-cache/192.168.1.100:8080
 	key := fmt.Sprintf("/services/%s/%s", svcName, addr)
 
 	putCtx, cancelPut := context.WithTimeout(ctx, 3*time.Second)
