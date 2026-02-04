@@ -87,11 +87,15 @@ func NewClient(addr string, svcName string, etcdCli *clientv3.Client) (*Client, 
 
 	// 3. 使用 grpc.NewClient 创建连接（替代 Dial / DialContext）
 	// 建一条到服务地址的 gRPC 连接, gRPC = 打电话的方式（远程调用用）
+	// 现在我知道要打给谁了（addr），我建立一条电话线（conn）
 	conn, err := grpc.NewClient(
 		addr,
+		// 不用 TLS，加密关掉（明文）
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 
 		// 如果当前连接暂时不可用，不要立刻返回错误，可以等一会儿，等连上再发请求
+		// 如果现在对方暂时没准备好（连接没立刻成功），不要立刻失败
+		// 允许 gRPC 在一段时间内等它就绪再发请求（具体等多久取决于每次 RPC 的 ctx deadline）
 		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
 	)
 
@@ -105,6 +109,12 @@ func NewClient(addr string, svcName string, etcdCli *clientv3.Client) (*Client, 
 
 	// 用这条连接生成 protobuf 的 gRPC 客户端
 	// protobuf：负责“请求/响应怎么定义与序列化”
+	// 用 conn 生成业务客户端 grpcCli（拨号器）
+	/*
+		conn 是“电话线”
+		grpcCli 是“拨号器/业务接口”，里面有 Get/Set/Delete 这些方法
+		调用 grpcCli.Get(ctx, req) 就会通过 conn 发到远端 server
+	*/
 	grpcClient := pb.NewGoCacheClient(conn)
 
 	client := &Client{
@@ -146,7 +156,8 @@ func (c *Client) Get(group, key string) ([]byte, error) {
 	return resp.GetValue(), nil
 }
 
-// 在 3 秒超时限制内，通过 gRPC 请求远程节点删除 group/key，RPC 成功就返回服务端给的 bool；失败就返回 error
+// 在 3 秒超时限制内，通过 gRPC 请求远程节点，在远端节点上，删除“某个 group（缓存分组）里的某个 key”
+// RPC 成功就返回服务端给的 bool；失败就返回 error
 func (c *Client) Delete(group, key string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

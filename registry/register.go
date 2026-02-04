@@ -85,6 +85,8 @@ func Register(ctx context.Context, svcName, addr string) error {
 		租约 ID 存在 lease.ID 里面。
 	*/
 	// 这一步要经过网络 → etcd → 返回结果
+	// 没有 WithTimeout，就不存在“Grant 超时”这件事（除非你外层 ctx 本来就会超时/取消）。
+	// 它只会一直等：要么成功返回，要么遇到错误返回，要么 ctx 被取消
 	lease, err := cli.Grant(leaseCtx, 10) // TTL = 10 秒
 
 	// Grant 返回后，这个 leaseCtx 已经没用了，及时 cancel()：防止 context 泄露
@@ -98,9 +100,12 @@ func Register(ctx context.Context, svcName, addr string) error {
 	// 构造 key，比如：/services/go-cache/192.168.1.100:8080
 	key := fmt.Sprintf("/services/%s/%s", svcName, addr)
 
+	// 写入服务信息（Put）：把自己贴到通讯录，并绑定租约
 	putCtx, cancelPut := context.WithTimeout(ctx, 3*time.Second)
 
 	// 把 key -> addr 这条记录写入 etcd；并绑定到刚刚创建的租约 lease.ID
+	// 往 etcd 写一条记录：key 表示我是谁，value 表示我的地址，并且把它绑定到租约上。
+	// 租约过期 → 这条 key 自动删掉（自动下线）
 	_, err = cli.Put(putCtx, key, addr, clientv3.WithLease(lease.ID))
 	cancelPut()
 	if err != nil {
@@ -113,6 +118,7 @@ func Register(ctx context.Context, svcName, addr string) error {
 	kaCtx, cancelKA := context.WithCancel(ctx)
 
 	// 启动一个后台心跳机制，定期向 etcd 发送续约请求，让 lease 一直存活
+	// keepAliveCh 是一个 channel，会不断收到续租结果（resp）
 	keepAliveCh, err := cli.KeepAlive(kaCtx, lease.ID)
 	if err != nil {
 		cancelKA()
@@ -124,7 +130,10 @@ func Register(ctx context.Context, svcName, addr string) error {
 	go func() {
 		defer func() {
 			// cancelKA()：停止 keepalive
+			// 停止租约续租（KeepAlive）
+			// 让 etcd 客户端不再继续发心跳，不再占用 goroutine/连接/资源
 			cancelKA()
+			// 关闭 etcd client（cli.Close），释放底层连接、goroutine、资源。
 			cleanup()
 		}()
 
@@ -135,6 +144,9 @@ func Register(ctx context.Context, svcName, addr string) error {
 			case <-ctx.Done():
 				// ctx 结束 → 主动撤销租约，下线服务
 				// 创建一个新的 context：revokeCtx，最多等 3 秒
+				// 为什么不用原来的 ctx，而用 context.Background()？
+				// 因为此刻 ctx 已经 Done 了，用它会立刻取消，Revoke 可能来不及发出去
+				// 所以新建一个背景 ctx + 3 秒超时，保证有机会把撤销请求发出去
 				revokeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				/*
 					显式撤销这个租约；

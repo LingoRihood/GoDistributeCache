@@ -37,6 +37,7 @@ type Peer interface {
 }
 
 // ClientPicker 实现了PeerPicker接口
+// 路由器 + 服务发现 + 一致性哈希环
 type ClientPicker struct {
 	selfAddr string              // 自己的地址（用于避免把自己当远端）
 	svcName  string              // 服务名，用于拼 etcd 的 key 前缀
@@ -101,7 +102,9 @@ func NewClientPicker(addr string, opts ...PickerOption) (*ClientPicker, error) {
 
 	// 启动服务发现
 	if err := picker.startServiceDiscovery(); err != nil {
+		// 把这个 ClientPicker 的后台协程/子流程都停掉
 		cancel()
+		// 把连接 etcd 的网络资源关掉
 		cli.Close()
 		return nil, err
 	}
@@ -128,6 +131,7 @@ func (p *ClientPicker) fetchAllServices() error {
 	// p.ctx 是在 NewClientPicker 里创建、保存的那个 context，代表整个 ClientPicker 的生命周期
 	// 以 p.ctx 为父 context，再套一层“最多 3 秒”的超时
 	ctx, cancel := context.WithTimeout(p.ctx, 3*time.Second)
+	// 请求完成后立刻释放 timer 资源。
 	defer cancel()
 
 	// 把所有 /services/go-cache/* 的 key 都查出来
@@ -154,6 +158,7 @@ func (p *ClientPicker) fetchAllServices() error {
 		addr := string(kv.Value)
 		if addr != "" && addr != p.selfAddr {
 			// 不把“自己这个节点”当成远程节点加入
+			// 把一个远端节点加入 picker 的“可用节点列表”
 			p.set(addr)
 			logrus.Infof("Discovered service at %s", addr)
 		}
@@ -163,7 +168,7 @@ func (p *ClientPicker) fetchAllServices() error {
 
 // watchServiceChanges 监听服务实例变化
 func (p *ClientPicker) watchServiceChanges() {
-	// 基于这个 etcd 客户端，创建一个“watcher 对象”
+	// 基于现有 etcd client，创建一个专门“看变更”的 watcher
 	watcher := clientv3.NewWatcher(p.etcdCli)
 
 	// etcd 里面只要有对应 key 的变化，它就会往这个 channel 里塞一条 WatchResponse
@@ -172,7 +177,8 @@ func (p *ClientPicker) watchServiceChanges() {
 
 	for {
 		select {
-		// 当外面调用了 p.cancel()（通常在 picker.Close() 里）；或者 p.ctx 因为父 context 被取消；这个 channel 就会被关闭；<-p.ctx.Done() 就会立刻收到信号
+		// 当外面调用了 p.cancel()（通常在 picker.Close() 里）；或者 p.ctx 因为父 context 被取消；
+		// 这个 channel 就会被关闭；<-p.ctx.Done() 就会立刻收到信号
 		case <-p.ctx.Done():
 			watcher.Close()
 			return
@@ -184,11 +190,13 @@ func (p *ClientPicker) watchServiceChanges() {
 }
 
 // handleWatchEvents 处理监听到的事件
+// 更新“本地路由表”和“一致性哈希环”
 func (p *ClientPicker) handleWatchEvents(events []*clientv3.Event) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for _, event := range events {
+		// 从 event.Kv.Value 取 addr
 		addr := string(event.Kv.Value)
 		// 如果这条事件是关于我自己的地址，那就忽略，不当成远程节点来处理
 		if addr == p.selfAddr {

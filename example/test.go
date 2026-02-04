@@ -32,7 +32,7 @@ func main() {
 
 	// 创建节点
 	// 一个“自己本机的缓存节点对象”(node)
-	// 启动一个缓存 Server（注册到 etcd，提供 gRPC 服务）
+	// 启动一个缓存 Server（注册到 etcd，对外提供 Get/Set/Delete）
 	// addr：这是这个缓存节点自己对外提供 gRPC 服务的监听地址(我这个节点对外提供服务的端口是 8001，别人要找我干活就连我 8001)
 	node, err := lcache.NewServer(addr, "go-cache",
 		// 电话簿(通讯录)在本机的 2379 端口，去那里登记/查人
